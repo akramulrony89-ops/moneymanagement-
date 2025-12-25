@@ -50,7 +50,10 @@
                 </div>
                 <div>
                     <h1 class="text-2xl md:text-3xl font-bold text-slate-900">Rony Money Management</h1>
-                    <p class="text-slate-500 text-sm">Dashboard & Monthly Reports</p>
+                    <div class="flex items-center gap-2">
+                        <p class="text-slate-500 text-sm">Cloud Dashboard</p>
+                        <span id="connection-status" class="inline-block w-2 h-2 rounded-full bg-red-500 animate-pulse" title="Connecting..."></span>
+                    </div>
                 </div>
             </div>
             <button onclick="window.print()" class="flex items-center gap-2 bg-slate-800 text-white px-6 py-2.5 rounded-lg font-semibold hover:bg-slate-700 transition shadow-lg shadow-slate-200">
@@ -167,7 +170,7 @@
                         </div>
 
                         <!-- Submit Button -->
-                        <button type="submit" id="btn-submit" class="w-full py-3 rounded-lg font-bold text-white bg-emerald-600 hover:bg-emerald-700 transition shadow-lg mt-2">
+                        <button type="submit" id="btn-submit" class="w-full py-3 rounded-lg font-bold text-white bg-emerald-600 hover:bg-emerald-700 transition shadow-lg mt-2 disabled:opacity-50 disabled:cursor-not-allowed">
                             Add Income
                         </button>
                     </form>
@@ -182,10 +185,10 @@
                     <div class="p-4 border-b bg-slate-50 flex flex-col sm:flex-row justify-between items-center gap-4">
                         <div class="flex items-center gap-2">
                             <span class="text-sm font-bold text-slate-700">Filter Report:</span>
-                            <input type="month" id="month-filter" onchange="render()" class="px-3 py-1.5 rounded-lg border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
-                            <button onclick="clearFilter()" class="text-sm text-indigo-600 hover:underline px-2">Show All</button>
+                            <input type="month" id="month-filter" onchange="window.render()" class="px-3 py-1.5 rounded-lg border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
+                            <button onclick="window.clearFilter()" class="text-sm text-indigo-600 hover:underline px-2">Show All</button>
                         </div>
-                        <button onclick="clearData()" class="text-xs text-rose-500 font-semibold hover:bg-rose-50 px-3 py-1.5 rounded transition">Reset All Data</button>
+                        <button onclick="window.clearData()" class="text-xs text-rose-500 font-semibold hover:bg-rose-50 px-3 py-1.5 rounded transition">Reset All Data</button>
                     </div>
 
                     <!-- List Header -->
@@ -212,7 +215,7 @@
                     </div>
                     <div id="empty-msg" class="p-12 text-center text-slate-400 hidden flex flex-col items-center">
                         <svg class="w-12 h-12 mb-3 opacity-20" fill="currentColor" viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14z"/></svg>
-                        <span>No records found for this period.</span>
+                        <span>No records found.</span>
                     </div>
                 </div>
             </div>
@@ -276,36 +279,90 @@
 
     </div>
 
-    <script>
-        // Data Structure
-        let transactions = JSON.parse(localStorage.getItem('ronyMoneyDataV3')) || [];
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase Config & Init ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = __app_id || 'default-app';
+
+        // --- State ---
+        let user = null;
+        let transactions = [];
+        let unsubscribe = null;
         let currentMode = 'income';
 
-        // Elements
+        // --- DOM Elements ---
+        const connectionStatus = document.getElementById('connection-status');
         const form = document.getElementById('tx-form');
         const dateInput = document.getElementById('date');
         const submitBtn = document.getElementById('btn-submit');
-        const accountSelect = document.getElementById('account');
-        const targetDiv = document.getElementById('target-div');
-        const targetSelect = document.getElementById('target-account');
-        const lblSource = document.getElementById('lbl-source');
-        const transferInfo = document.getElementById('transfer-info');
-        const monthFilter = document.getElementById('month-filter');
-        const listStatus = document.getElementById('list-status');
-        const printTitle = document.getElementById('print-title');
+        
+        // --- Auth Logic ---
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth Failed", err);
+                connectionStatus.className = "inline-block w-2 h-2 rounded-full bg-red-700";
+            }
+        };
+        initAuth();
 
-        // Tabs
-        const tabInc = document.getElementById('tab-income');
-        const tabExp = document.getElementById('tab-expense');
-        const tabTra = document.getElementById('tab-transfer');
+        onAuthStateChanged(auth, (u) => {
+            user = u;
+            if (user) {
+                connectionStatus.className = "inline-block w-2 h-2 rounded-full bg-emerald-500";
+                connectionStatus.title = "Connected securely to cloud";
+                setupRealtimeListener();
+            } else {
+                connectionStatus.className = "inline-block w-2 h-2 rounded-full bg-red-500";
+                transactions = [];
+                render();
+            }
+        });
 
-        // Init
-        dateInput.valueAsDate = new Date();
-        render();
+        // --- Firestore Listener ---
+        function setupRealtimeListener() {
+            if (!user) return;
+            if (unsubscribe) unsubscribe();
 
-        function setMode(mode) {
-            currentMode = mode;
+            const colRef = collection(db, 'artifacts', appId, 'users', user.uid, 'transactions');
             
+            unsubscribe = onSnapshot(colRef, (snapshot) => {
+                transactions = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                render();
+            }, (error) => {
+                console.error("Data fetch error:", error);
+                connectionStatus.className = "inline-block w-2 h-2 rounded-full bg-yellow-500";
+            });
+        }
+
+        // --- Core Logic Exposed to Window (to work with HTML onclick) ---
+        
+        window.setMode = (mode) => {
+            currentMode = mode;
+            const tabInc = document.getElementById('tab-income');
+            const tabExp = document.getElementById('tab-expense');
+            const tabTra = document.getElementById('tab-transfer');
+            const lblSource = document.getElementById('lbl-source');
+            const targetDiv = document.getElementById('target-div');
+            const transferInfo = document.getElementById('transfer-info');
+            const accountSelect = document.getElementById('account');
+            const targetSelect = document.getElementById('target-account');
+
             // Reset styles
             [tabInc, tabExp, tabTra].forEach(t => {
                 t.className = "py-2 text-sm font-semibold rounded-md text-slate-500 hover:text-slate-700 transition";
@@ -363,62 +420,45 @@
                     <option value="Bank">Bank Account</option>
                 `;
             }
-        }
+        };
 
-        function clearFilter() {
-            monthFilter.value = "";
+        window.clearFilter = () => {
+            document.getElementById('month-filter').value = "";
             render();
-        }
+        };
 
-        form.addEventListener('submit', (e) => {
-            e.preventDefault();
-            
-            const item = {
-                id: Date.now(),
-                mode: currentMode,
-                amount: parseFloat(document.getElementById('amount').value),
-                date: document.getElementById('date').value,
-                category: document.getElementById('category').value,
-                account: document.getElementById('account').value, 
-                target: currentMode === 'transfer' ? document.getElementById('target-account').value : null 
-            };
-
-            transactions.push(item);
-            save();
-            render();
-            form.reset();
-            dateInput.valueAsDate = new Date();
-            setMode(currentMode); // Restore dropdowns
-        });
-
-        function deleteTx(id) {
-            if(confirm("Delete this entry?")) {
-                transactions = transactions.filter(t => t.id !== id);
-                save();
-                render();
+        window.deleteTx = async (id) => {
+            if(!user) return;
+            if(confirm("Delete this entry permanently?")) {
+                try {
+                    await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'transactions', id));
+                } catch(e) {
+                    console.error("Delete failed", e);
+                    alert("Error deleting item.");
+                }
             }
-        }
+        };
 
-        function clearData() {
-            if(confirm("DANGER: This will delete ALL history permanently. Continue?")) {
-                transactions = [];
-                save();
-                render();
+        window.clearData = async () => {
+            if(!user) return;
+            if(confirm("DANGER: This will delete ALL history permanently from the cloud. Continue?")) {
+                // Batch delete not ideal for large sets without pagination, but ok for this scope
+                const colRef = collection(db, 'artifacts', appId, 'users', user.uid, 'transactions');
+                const snap = await getDocs(colRef);
+                const batch = writeBatch(db);
+                snap.docs.forEach(doc => batch.delete(doc.ref));
+                await batch.commit();
             }
-        }
+        };
 
-        function save() {
-            localStorage.setItem('ronyMoneyDataV3', JSON.stringify(transactions));
-        }
-
-        function formatMoney(n) {
-            return '৳' + n.toLocaleString('en-BD', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-        }
-
-        function render() {
+        // --- Render Logic ---
+        window.render = () => {
             const tbody = document.getElementById('table-body');
             const pbody = document.getElementById('print-table-body');
             const emptyMsg = document.getElementById('empty-msg');
+            const monthFilter = document.getElementById('month-filter');
+            const listStatus = document.getElementById('list-status');
+            const printTitle = document.getElementById('print-title');
             
             tbody.innerHTML = '';
             pbody.innerHTML = '';
@@ -445,7 +485,7 @@
                     if(t.account === 'Mobile') balMobile -= t.amount;
                     if(t.account === 'Cash') balCash -= t.amount;
 
-                    // Add to Target (handle old data where target might be implicitly Cash)
+                    // Add to Target
                     const dest = t.target || 'Cash';
                     if(dest === 'Cash') balCash += t.amount;
                     if(dest === 'Bank') balBank += t.amount;
@@ -454,6 +494,8 @@
             });
 
             // Update Header Stats (Live)
+            const formatMoney = (n) => '৳' + n.toLocaleString('en-BD', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+            
             document.getElementById('disp-total').textContent = formatMoney(balCash + balBank + balMobile);
             document.getElementById('disp-cash').textContent = formatMoney(balCash);
             document.getElementById('disp-bank').textContent = formatMoney(balBank);
@@ -467,7 +509,6 @@
             if (filterVal) {
                 filteredTx = filteredTx.filter(t => t.date.startsWith(filterVal));
                 
-                // Format nicely for display "January 2025"
                 const [y, m] = filterVal.split('-');
                 const dateObj = new Date(y, m - 1);
                 const monthName = dateObj.toLocaleString('default', { month: 'long', year: 'numeric' });
@@ -493,8 +534,6 @@
                 // Period Stats logic
                 if(t.mode === 'income') periodInc += t.amount;
                 if(t.mode === 'expense') periodExp += t.amount;
-                // Note: Withdrawals are internal transfers, so they don't affect "Net Period Flow" usually,
-                // but for expense tracking, they are neutral. 
 
                 // Render Tables
                 let typeBadge = '';
@@ -520,7 +559,7 @@
                     amtColor = 'text-amber-600 font-bold';
                     accDisplay = `${t.account} ➜ ${t.target || 'Cash'}`;
                     printIn = '-';
-                    printOut = `(${formatMoney(t.amount)})`; // Transfer
+                    printOut = `(${formatMoney(t.amount)})`; 
                 }
 
                 // Screen Table
@@ -533,7 +572,7 @@
                     <td class="px-4 py-3 text-slate-600 text-xs">${accDisplay}</td>
                     <td class="px-4 py-3 text-right ${amtColor}">${t.mode === 'expense' ? '-' : ''}${formatMoney(t.amount)}</td>
                     <td class="px-4 py-3 text-center">
-                        <button onclick="deleteTx(${t.id})" class="text-slate-300 hover:text-rose-500 font-bold px-2 hover:bg-slate-100 rounded">&times;</button>
+                        <button onclick="deleteTx('${t.id}')" class="text-slate-300 hover:text-rose-500 font-bold px-2 hover:bg-slate-100 rounded">&times;</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -559,7 +598,55 @@
             document.getElementById('p-period-net').className = `text-xl font-bold ${net >= 0 ? 'text-emerald-700' : 'text-rose-700'}`;
             
             document.getElementById('print-date-display').textContent = new Date().toLocaleString();
-        }
+        };
+
+        // --- Form Submission ---
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if(!user) {
+                alert("Cloud connection not ready. Please wait.");
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.innerText = "Saving...";
+
+            const amountVal = parseFloat(document.getElementById('amount').value);
+            const dateVal = document.getElementById('date').value;
+            const catVal = document.getElementById('category').value;
+            const accVal = document.getElementById('account').value;
+            const targetVal = document.getElementById('target-account').value;
+
+            const newItem = {
+                mode: currentMode,
+                amount: amountVal,
+                date: dateVal,
+                category: catVal,
+                account: accVal,
+                target: currentMode === 'transfer' ? targetVal : null,
+                timestamp: new Date().toISOString() // Good for sorting if needed
+            };
+
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'transactions'), newItem);
+                form.reset();
+                dateInput.value = dateVal; // Keep date
+                window.setMode(currentMode); // Restore dropdowns
+            } catch(err) {
+                console.error("Save failed", err);
+                alert("Failed to save to cloud.");
+            } finally {
+                submitBtn.disabled = false;
+                if(currentMode === 'income') submitBtn.innerText = "Add Income (+)";
+                else if(currentMode === 'expense') submitBtn.innerText = "Add Expense (-)";
+                else submitBtn.innerText = "Transfer Funds";
+            }
+        });
+
+        // Initialize Defaults
+        dateInput.valueAsDate = new Date();
+        window.setMode('income');
+
     </script>
 </body>
 </html>
